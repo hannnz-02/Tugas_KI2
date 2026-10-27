@@ -1,23 +1,187 @@
-import socket
+
 import argparse
+import socket
+import threading
 
 from aes_manual import (
     send_json,
     recv_json,
     encrypt_json_hex,
+    decrypt_json_hex,
     make_ascii_key
 )
 
+LOCK = threading.Lock()
 
-def input_key(nama):
-    key = input(
-        f"Masukkan {nama} (16 karakter ASCII): "
-    )
+KEYS = {
+    "Alice": None,
+    "Bob": None
+}
 
-    if len(key.encode("ascii")) != 16:
-        raise ValueError("Kunci harus 16 byte ASCII.")
 
-    return key.encode("ascii")
+def input_key(label):
+    while True:
+        value = input(
+            f"Masukkan {label} (16 karakter ASCII): "
+        )
+
+        try:
+            key = value.encode("ascii")
+        except UnicodeEncodeError:
+            print("Kunci harus menggunakan ASCII.")
+            continue
+
+        if len(key) == 16:
+            return key
+
+        print("Kunci harus tepat 16 byte.")
+
+
+def handle_client(conn, address):
+    with conn:
+        try:
+            request = recv_json(conn)
+            jenis = request.get("type")
+
+            if jenis == "KDC_REQUEST":
+                ida = request.get("IDA")
+                idb = request.get("IDB")
+                n1 = request.get("N1")
+
+                if (
+                    ida not in KEYS
+                    or idb not in KEYS
+                    or ida == idb
+                    or not isinstance(n1, str)
+                ):
+                    send_json(conn, {
+                        "type": "ERROR",
+                        "message": "Identitas atau nonce tidak valid"
+                    })
+                    return
+
+                with LOCK:
+                    key_initiator = KEYS[ida]
+                    key_target = KEYS[idb]
+
+                ks = make_ascii_key()
+
+                # Bagian untuk peminta: E(KA, KS || IDA || IDB || N1)
+                bagian_peminta = encrypt_json_hex(
+                    key_initiator,
+                    {
+                        "KS": ks.decode("ascii"),
+                        "IDA": ida,
+                        "IDB": idb,
+                        "N1": n1
+                    }
+                )
+
+                # Tiket target: E(KB, KS || IDA)
+                tiket_target = encrypt_json_hex(
+                    key_target,
+                    {
+                        "KS": ks.decode("ascii"),
+                        "IDA": ida
+                    }
+                )
+
+                send_json(conn, {
+                    "type": "KDC_RESPONSE",
+                    "step": 2,
+                    "alice_part_hex": bagian_peminta,
+                    "ticket_bob_hex": tiket_target
+                })
+
+                print(
+                    f"[KDC] Session baru dibuat: {ida} -> {idb}"
+                )
+
+            elif jenis in ("CHANGE_KA", "CHANGE_KB"):
+                identity = (
+                    "Alice" if jenis == "CHANGE_KA" else "Bob"
+                )
+
+                with LOCK:
+                    old_key = KEYS[identity]
+
+                update = decrypt_json_hex(
+                    old_key, request["update_hex"]
+                )
+
+                new_text = update.get("new_key", "")
+                new_key = new_text.encode("ascii")
+
+                if len(new_key) != 16:
+                    send_json(conn, {
+                        "type": "ERROR",
+                        "message": "Kunci harus 16 byte ASCII"
+                    })
+                    return
+
+                with LOCK:
+                    KEYS[identity] = new_key
+
+                send_json(conn, {
+                    "type": "KEY_CHANGED",
+                    "identity": identity
+                })
+
+                print(f"[KDC] Kunci {identity} diperbarui.")
+
+            else:
+                send_json(conn, {
+                    "type": "ERROR",
+                    "message": "Jenis permintaan tidak dikenal"
+                })
+
+        except Exception as error:
+            print("[KDC] Kesalahan:", error)
+
+            try:
+                send_json(conn, {
+                    "type": "ERROR",
+                    "message": "Permintaan gagal"
+                })
+            except Exception:
+                pass
+
+
+def console_menu():
+    while True:
+        print("1. Ganti KA")
+        print("2. Ganti KB")
+        print("3. Kembali menunggu permintaan")
+
+        choice = input("Pilih: ").strip()
+
+        if choice == "1":
+            new_key = input_key("KA baru")
+
+            with LOCK:
+                KEYS["Alice"] = new_key
+
+            print(
+                "KA di KDC berubah. "
+                "Alice juga harus memakai KA yang sama."
+            )
+
+        elif choice == "2":
+            new_key = input_key("KB baru")
+
+            with LOCK:
+                KEYS["Bob"] = new_key
+
+            print(
+                "KB di KDC berubah. "
+                "Bob juga harus memakai KB yang sama."
+            )
+
+        elif choice == "3":
+            continue
+
+        else:
+            print("Pilihan tidak valid.")
 
 
 def main():
@@ -26,65 +190,39 @@ def main():
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
 
-    KA = input_key("KA untuk Alice")
-    KB = input_key("KB untuk Bob")
+    KEYS["Alice"] = input_key("KA")
+    KEYS["Bob"] = input_key("KB")
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((args.host, args.port))
-    server.listen()
+    threading.Thread(
+        target=console_menu,
+        daemon=True
+    ).start()
 
-    print("KDC aktif:", args.host, args.port)
+    with socket.socket(
+        socket.AF_INET, socket.SOCK_STREAM
+    ) as server:
 
-    while True:
-        conn, addr = server.accept()
+        server.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1
+        )
 
-        with conn:
-            try:
-                request = recv_json(conn)
+        server.bind((args.host, args.port))
+        server.listen()
 
-                if request.get("type") != "KDC_REQUEST":
-                    send_json(conn, {
-                        "type": "ERROR",
-                        "message": "Permintaan tidak valid"
-                    })
-                    continue
+        print(
+            f"KDC berjalan pada {args.host}:{args.port}"
+        )
 
-                IDA = request["IDA"]
-                IDB = request["IDB"]
-                N1 = request["N1"]
+        while True:
+            conn, address = server.accept()
 
-                # KDC membuat session key baru.
-                KS = make_ascii_key()
-
-                # Langkah 2 bagian untuk Alice.
-                bagian_alice = encrypt_json_hex(KA, {
-                    "KS": KS.decode("ascii"),
-                    "IDA": IDA,
-                    "IDB": IDB,
-                    "N1": N1
-                })
-
-                # Langkah 2 tiket untuk Bob.
-                tiket_bob = encrypt_json_hex(KB, {
-                    "KS": KS.decode("ascii"),
-                    "IDA": IDA
-                })
-
-                send_json(conn, {
-                    "type": "KDC_RESPONSE",
-                    "step": 2,
-                    "alice_part_hex": bagian_alice,
-                    "ticket_bob_hex": tiket_bob
-                })
-
-                print("Langkah 1 diterima dari:", addr)
-                print("Langkah 2 selesai. Session key dibuat.")
-
-            except Exception as e:
-                print("Kesalahan KDC:", e)
-
-    server.close()
+            threading.Thread(
+                target=handle_client,
+                args=(conn, address),
+                daemon=True
+            ).start()
 
 
 if __name__ == "__main__":
