@@ -1,4 +1,6 @@
-# aes_manual.py
+import json
+import struct
+
 SBOX = [
 0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
 0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -180,6 +182,23 @@ def recv_json(sock):
     import json, struct
     size = struct.unpack("!I", recv_exact(sock, 4))[0]
     return json.loads(recv_exact(sock, size).decode("ascii"))
+
+def encrypt_json_hex(key, obj):
+    text = json.dumps(obj, separators=(",", ":"))
+    return encrypt_text_hex(key, text)
+
+
+def decrypt_json_hex(key, cipher_hex):
+    text = decrypt_text_hex(key, cipher_hex)
+    return json.loads(text)
+
+
+def make_ascii_key():
+    import secrets
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(
+        secrets.choice(alphabet) for _ in range(16)
+    ).encode("ascii")
 
 if __name__ == "__main__":
     key = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
