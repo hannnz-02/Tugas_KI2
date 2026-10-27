@@ -1,77 +1,90 @@
 import socket
-import secrets
-import json
-from aes_manual import encrypt_cbc, send_json, recv_json
+import argparse
 
-KDC_IP = "127.0.0.1"
-KDC_PORT = 5000
-
-KEY_A = b"AliceKey12345678"
-KEY_B = b"BobKey1234567890"
-
-
-def encrypt_packet(key, data):
-    text = json.dumps(data, separators=(",", ":")).encode("ascii")
-    return encrypt_cbc(key, text).hex()
+from aes_manual import (
+    send_json,
+    recv_json,
+    encrypt_json_hex,
+    make_ascii_key
+)
 
 
-def handle_client(conn, address):
-    try:
-        request = recv_json(conn)
+def input_key(nama):
+    key = input(
+        f"Masukkan {nama} (16 karakter ASCII): "
+    )
 
-        if request is None or request.get("type") != "REQUEST_KEY":
-            send_json(conn, {
-                "status": "ERROR",
-                "message": "Request tidak dikenal"
-            })
-            return
+    if len(key.encode("ascii")) != 16:
+        raise ValueError("Kunci harus 16 byte ASCII.")
 
-        session_key = secrets.token_bytes(16)
-
-        print("\nPermintaan session key dari:", address[0])
-        print("Session key baru dibuat:", session_key.hex())
-
-        packet_alice = {
-            "session_key": session_key.hex(),
-            "alice": "Alice",
-            "bob": "Bob"
-        }
-
-        ticket_bob = {
-            "session_key": session_key.hex(),
-            "alice": "Alice",
-            "bob": "Bob"
-        }
-
-        response = {
-            "status": "OK",
-            "alice_packet": encrypt_packet(KEY_A, packet_alice),
-            "bob_ticket": encrypt_packet(KEY_B, ticket_bob)
-        }
-
-        send_json(conn, response)
-
-        print("Paket terenkripsi dikirim kepada Alice.")
-        print("Tiket terenkripsi untuk Bob disertakan.")
-
-    except Exception as e:
-        print("Kesalahan KDC:", e)
-
-    finally:
-        conn.close()
+    return key.encode("ascii")
 
 
 def main():
-    print("KDC berjalan pada port", KDC_PORT)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", type=int, default=5000)
+    args = parser.parse_args()
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((KDC_IP, KDC_PORT))
-        server.listen()
+    KA = input_key("KA untuk Alice")
+    KB = input_key("KB untuk Bob")
 
-        while True:
-            conn, address = server.accept()
-            handle_client(conn, address)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((args.host, args.port))
+    server.listen()
+
+    print("KDC aktif:", args.host, args.port)
+
+    while True:
+        conn, addr = server.accept()
+
+        with conn:
+            try:
+                request = recv_json(conn)
+
+                if request.get("type") != "KDC_REQUEST":
+                    send_json(conn, {
+                        "type": "ERROR",
+                        "message": "Permintaan tidak valid"
+                    })
+                    continue
+
+                IDA = request["IDA"]
+                IDB = request["IDB"]
+                N1 = request["N1"]
+
+                # KDC membuat session key baru.
+                KS = make_ascii_key()
+
+                # Langkah 2 bagian untuk Alice.
+                bagian_alice = encrypt_json_hex(KA, {
+                    "KS": KS.decode("ascii"),
+                    "IDA": IDA,
+                    "IDB": IDB,
+                    "N1": N1
+                })
+
+                # Langkah 2 tiket untuk Bob.
+                tiket_bob = encrypt_json_hex(KB, {
+                    "KS": KS.decode("ascii"),
+                    "IDA": IDA
+                })
+
+                send_json(conn, {
+                    "type": "KDC_RESPONSE",
+                    "step": 2,
+                    "alice_part_hex": bagian_alice,
+                    "ticket_bob_hex": tiket_bob
+                })
+
+                print("Langkah 1 diterima dari:", addr)
+                print("Langkah 2 selesai. Session key dibuat.")
+
+            except Exception as e:
+                print("Kesalahan KDC:", e)
+
+    server.close()
 
 
 if __name__ == "__main__":
