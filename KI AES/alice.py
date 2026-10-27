@@ -1,5 +1,7 @@
+
+
 import socket
-import argparse
+import json
 import secrets
 import threading
 
@@ -9,169 +11,233 @@ from aes_manual import (
     encrypt_json_hex,
     decrypt_json_hex,
     encrypt_text_hex,
-    decrypt_text_hex
+    decrypt_text_hex,
 )
 
+# Konfigurasi Alice
+KDC_IP = "192.168.43.129"
+KDC_PORT = 5000
+ALICE_IP = "0.0.0.0"
+ALICE_PORT = 5001
+BOB_IP = "192.168.43.130"
+BOB_PORT = 5001
 
-def input_key():
-    key = input("Masukkan KA (16 karakter ASCII): ")
-
-    if len(key.encode("ascii")) != 16:
-        raise ValueError("KA harus 16 byte ASCII.")
-
-    return key.encode("ascii")
+KA = b"1234567890ABCDEF"
 
 
-def receive_messages(sock, KS):
+def terima_pesan(conn, session_key):
     while True:
         try:
-            data = recv_json(sock)
+            data = recv_json(conn)
 
             if data.get("type") == "CHAT":
-                print("\nCiphertext Hex dari Bob:")
-                print(data["cipher_hex"])
-
                 plaintext = decrypt_text_hex(
-                    KS, data["cipher_hex"]
+                    session_key, data["cipher_hex"]
                 )
-
-                print("Bob:", plaintext)
-                print("Alice> ", end="", flush=True)
+                print(f"\n{data['sender']}: {plaintext}")
 
             elif data.get("type") == "CHAT_QUIT":
-                print("\nBob memutuskan koneksi.")
+                print("\nBob mengakhiri sesi.")
                 break
 
-        except Exception as e:
-            print("\nKoneksi berakhir:", e)
+        except Exception:
+            print("\nKoneksi berakhir.")
             break
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--kdc", required=True)
-    parser.add_argument("--kdc-port", type=int, default=5000)
-    parser.add_argument("--bob", required=True)
-    parser.add_argument("--bob-port", type=int, default=5001)
-    args = parser.parse_args()
+def komunikasi(conn, session_key):
+    threading.Thread(
+        target=terima_pesan,
+        args=(conn, session_key),
+        daemon=True
+    ).start()
 
-    KA = input_key()
+    while True:
+        try:
+            pesan = input("Alice: ")
 
-    IDA = "Alice"
-    IDB = "Bob"
-    N1 = secrets.token_hex(8)
+            if pesan == "/quit":
+                send_json(conn, {"type": "CHAT_QUIT"})
+                break
 
-    # Langkah 1: Alice meminta session key kepada KDC.
+            pesan.encode("ascii")
+
+            ciphertext = encrypt_text_hex(
+                session_key, pesan
+            )
+
+            send_json(conn, {
+                "type": "CHAT",
+                "sender": "Alice",
+                "cipher_hex": ciphertext
+            })
+
+            print("Ciphertext Hex:", ciphertext)
+
+        except UnicodeEncodeError:
+            print("Gunakan karakter ASCII.")
+        except Exception as error:
+            print("Koneksi berakhir:", error)
+            break
+
+
+def minta_session_key():
+    n1 = secrets.token_hex(8)
+
     with socket.create_connection(
-        (args.kdc, args.kdc_port)
-    ) as sock:
-
-        send_json(sock, {
+        (KDC_IP, KDC_PORT)
+    ) as conn:
+        send_json(conn, {
             "type": "KDC_REQUEST",
-            "IDA": IDA,
-            "IDB": IDB,
-            "N1": N1
+            "IDA": "Alice",
+            "IDB": "Bob",
+            "N1": n1
         })
 
-        response = recv_json(sock)
+        response = recv_json(conn)
 
-    # Langkah 2: Alice membuka bagian yang dienkripsi KA.
     if response.get("type") != "KDC_RESPONSE":
-        raise ValueError("Respons KDC tidak valid.")
+        print("KDC menolak permintaan.")
+        return None, None
 
-    bagian = decrypt_json_hex(
+    bagian_alice = decrypt_json_hex(
         KA, response["alice_part_hex"]
     )
 
     if (
-        bagian["IDA"] != IDA
-        or bagian["IDB"] != IDB
-        or bagian["N1"] != N1
+        bagian_alice.get("IDA") != "Alice"
+        or bagian_alice.get("IDB") != "Bob"
+        or bagian_alice.get("N1") != n1
     ):
-        raise ValueError("Identitas atau nonce tidak cocok.")
+        print("Respons KDC tidak valid.")
+        return None, None
 
-    KS = bagian["KS"].encode("ascii")
+    session_key = bagian_alice["KS"].encode("ascii")
 
-    if len(KS) != 16:
-        raise ValueError("Session key tidak valid.")
+    print("Session key diterima dari KDC.")
+    return session_key, response["ticket_bob_hex"]
 
-    print("Langkah 1 dan 2 berhasil.")
 
-    # Langkah 3: Alice meneruskan tiket kepada Bob.
-    with socket.create_connection(
-        (args.bob, args.bob_port)
-    ) as sock:
+def mulai_sesi():
+    session_key, tiket = minta_session_key()
 
-        send_json(sock, {
-            "type": "TICKET",
-            "step": 3,
-            "ticket_bob_hex": response["ticket_bob_hex"]
-        })
+    if session_key is None:
+        return
 
-        # Langkah 4: Alice menerima E(KS, N2).
-        challenge = recv_json(sock)
+    try:
+        with socket.create_connection(
+            (BOB_IP, BOB_PORT)
+        ) as conn:
+            send_json(conn, {
+                "type": "TICKET",
+                "step": 3,
+                "initiator": "Alice",
+                "ticket_hex": tiket
+            })
 
-        if challenge.get("type") != "CHALLENGE":
-            raise ValueError("Challenge Bob tidak valid.")
+            challenge = recv_json(conn)
 
-        isi = decrypt_json_hex(
-            KS, challenge["n2_cipher_hex"]
+            n2 = decrypt_json_hex(
+                session_key,
+                challenge["n2_cipher_hex"]
+            )["N2"]
+
+            send_json(conn, {
+                "type": "CHALLENGE_RESPONSE",
+                "step": 5,
+                "response_cipher_hex": encrypt_json_hex(
+                    session_key,
+                    {"F_N2": n2[::-1]}
+                )
+            })
+
+            status = recv_json(conn)
+
+            if status.get("type") != "AUTH_OK":
+                print("Autentikasi gagal.")
+                return
+
+            print("Autentikasi Alice-Bob berhasil.")
+            print("Komunikasi AES dimulai.")
+
+            komunikasi(conn, session_key)
+
+    except Exception as error:
+        print("Gagal memulai sesi:", error)
+
+
+def listener():
+    with socket.socket(
+        socket.AF_INET, socket.SOCK_STREAM
+    ) as server:
+        server.setsockopt(
+            socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
         )
+        server.bind((ALICE_IP, ALICE_PORT))
+        server.listen()
 
-        N2 = isi["N2"]
+        print(f"Alice menunggu koneksi di port {ALICE_PORT}.")
 
-        # f(N2) dalam contoh ini adalah membalik karakter N2.
-        jawaban = N2[::-1]
+        while True:
+            conn, addr = server.accept()
+            threading.Thread(
+                target=layani_koneksi,
+                args=(conn, addr),
+                daemon=True
+            ).start()
 
-        # Langkah 5: Alice mengirim E(KS, f(N2)).
-        send_json(sock, {
-            "type": "CHALLENGE_RESPONSE",
-            "step": 5,
-            "response_cipher_hex": encrypt_json_hex(
-                KS, {"F_N2": jawaban}
+
+def layani_koneksi(conn, addr):
+    with conn:
+        try:
+            tiket = recv_json(conn)
+            if tiket.get("type") != "TICKET":
+                return
+
+            data_tiket = decrypt_json_hex(
+                KA, tiket["ticket_hex"]
             )
-        })
 
-        status = recv_json(sock)
+            session_key = data_tiket["KS"].encode("ascii")
+            n2 = secrets.token_hex(8)
 
-        if status.get("type") != "AUTH_OK":
-            raise ValueError("Autentikasi Alice gagal.")
+            send_json(conn, {
+                "type": "CHALLENGE",
+                "step": 4,
+                "n2_cipher_hex": encrypt_json_hex(
+                    session_key, {"N2": n2}
+                )
+            })
 
-        print("Langkah 5 berhasil.")
-        print("Autentikasi selesai. Chat AES aktif.")
+            jawaban = recv_json(conn)
+            hasil = decrypt_json_hex(
+                session_key, jawaban["response_cipher_hex"]
+            )
 
-        receiver = threading.Thread(
-            target=receive_messages,
-            args=(sock, KS),
-            daemon=True
-        )
-        receiver.start()
+            if hasil.get("F_N2") != n2[::-1]:
+                send_json(conn, {"type": "AUTH_FAIL"})
+                return
 
-        while receiver.is_alive():
-            try:
-                pesan = input("Alice> ")
+            send_json(conn, {"type": "AUTH_OK"})
+            komunikasi(conn, session_key)
 
-                if pesan == "/quit":
-                    send_json(sock, {"type": "CHAT_QUIT"})
-                    break
-
-                pesan.encode("ascii")
-
-                cipher = encrypt_text_hex(KS, pesan)
-
-                print("Ciphertext Hex:", cipher)
-
-                send_json(sock, {
-                    "type": "CHAT",
-                    "sender": "Alice",
-                    "cipher_hex": cipher
-                })
-
-            except UnicodeEncodeError:
-                print("Pesan harus menggunakan ASCII.")
-            except (ConnectionError, OSError):
-                break
+        except Exception as error:
+            print("Koneksi masuk gagal:", error)
 
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(
+        target=listener, daemon=True
+    ).start()
+
+    while True:
+        print("\n=== MENU ALICE ===")
+        print("1. Mulai sesi dengan Bob")
+        print("2. Keluar")
+
+        pilihan = input("Pilih: ")
+
+        if pilihan == "1":
+            mulai_sesi()
+        elif pilihan == "2":
+            break
