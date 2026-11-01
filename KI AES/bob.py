@@ -25,16 +25,11 @@ KB = b"FEDCBA0987654321"
 
 INPUT_LOCK = threading.Lock()
 SEND_LOCK = threading.Lock()
-SESSION_LOCK = threading.Lock()
-SESSION_ACTIVE = threading.Event()
 
 def safe_send(conn, data):
     with SEND_LOCK:
         send_json(conn, data)
         
-def get_key():
-    return KB
-
 def update_key():
     global KB
 
