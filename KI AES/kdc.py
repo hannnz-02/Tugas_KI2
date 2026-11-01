@@ -21,9 +21,7 @@ KEYS = {
 
 def input_key(label):
     while True:
-        value = input(
-            f"Masukkan {label} (16 karakter ASCII): "
-        )
+        value = input(f"Masukkan {label} (16 karakter ASCII): ")
 
         try:
             key = value.encode("ascii")
@@ -43,6 +41,7 @@ def handle_client(conn, address):
             request = recv_json(conn)
             jenis = request.get("type")
 
+            # LANGKAH 1 DAN 2: DISTRIBUSI SESSION KEY
             if jenis == "KDC_REQUEST":
                 ida = request.get("IDA")
                 idb = request.get("IDB")
@@ -53,6 +52,7 @@ def handle_client(conn, address):
                     or idb not in KEYS
                     or ida == idb
                     or not isinstance(n1, str)
+                    or not n1
                 ):
                     send_json(conn, {
                         "type": "ERROR",
@@ -64,10 +64,19 @@ def handle_client(conn, address):
                     key_initiator = KEYS[ida]
                     key_target = KEYS[idb]
 
+                if (
+                    not isinstance(key_initiator, bytes)
+                    or not isinstance(key_target, bytes)
+                    or len(key_initiator) != 16
+                    or len(key_target) != 16
+                ):
+                    raise ValueError("Key KDC tidak valid.")
+
+                # Membuat session key baru
                 ks = make_ascii_key()
 
-                # Bagian untuk peminta: E(KA, KS || IDA || IDB || N1)
-                bagian_peminta = encrypt_json_hex(
+                # Bagian untuk initiator
+                bagian_initiator = encrypt_json_hex(
                     key_initiator,
                     {
                         "KS": ks.decode("ascii"),
@@ -77,8 +86,8 @@ def handle_client(conn, address):
                     }
                 )
 
-                # Tiket target: E(KB, KS || IDA)
-                tiket_target = encrypt_json_hex(
+                # Ticket untuk responder
+                ticket_target = encrypt_json_hex(
                     key_target,
                     {
                         "KS": ks.decode("ascii"),
@@ -89,15 +98,15 @@ def handle_client(conn, address):
                 send_json(conn, {
                     "type": "KDC_RESPONSE",
                     "step": 2,
-                    "alice_part_hex": bagian_peminta,
-                    "ticket_bob_hex": tiket_target
+                    "initiator_part_hex": bagian_initiator,
+                    "ticket_target_hex": ticket_target
                 })
 
-                print(
-                    f"[KDC] Session baru dibuat: {ida} -> {idb}"
-                )
+                print(f"[KDC] Session key dibuat: {ida} -> {idb}")
 
+            # PERUBAHAN KA ATAU KB
             elif jenis in ("CHANGE_KA", "CHANGE_KB"):
+
                 identity = (
                     "Alice" if jenis == "CHANGE_KA" else "Bob"
                 )
@@ -106,20 +115,24 @@ def handle_client(conn, address):
                     old_key = KEYS[identity]
 
                 update = decrypt_json_hex(
-                    old_key, request["update_hex"]
+                    old_key,
+                    request["update_hex"]
                 )
 
-                new_text = update.get("new_key", "")
+                new_text = update.get("new_key")
+
+                if not isinstance(new_text, str):
+                    raise ValueError("Key harus berupa teks.")
+
                 new_key = new_text.encode("ascii")
 
                 if len(new_key) != 16:
-                    send_json(conn, {
-                        "type": "ERROR",
-                        "message": "Kunci harus 16 byte ASCII"
-                    })
-                    return
+                    raise ValueError("Key harus 16 byte ASCII.")
 
                 with LOCK:
+                    if KEYS[identity] != old_key:
+                        raise ValueError("Key berubah saat proses berlangsung.")
+
                     KEYS[identity] = new_key
 
                 send_json(conn, {
@@ -127,7 +140,7 @@ def handle_client(conn, address):
                     "identity": identity
                 })
 
-                print(f"[KDC] Kunci {identity} diperbarui.")
+                print(f"[KDC] Key {identity} berhasil diperbarui.")
 
             else:
                 send_json(conn, {
@@ -141,65 +154,25 @@ def handle_client(conn, address):
             try:
                 send_json(conn, {
                     "type": "ERROR",
-                    "message": "Permintaan gagal"
+                    "message": str(error)
                 })
             except Exception:
                 pass
-
-
-def console_menu():
-    while True:
-        print("1. Ganti KA")
-        print("2. Ganti KB")
-        print("3. Kembali menunggu permintaan")
-
-        choice = input("Pilih: ").strip()
-
-        if choice == "1":
-            new_key = input_key("KA baru")
-
-            with LOCK:
-                KEYS["Alice"] = new_key
-
-            print(
-                "KA di KDC berubah. "
-                "Alice juga harus memakai KA yang sama."
-            )
-
-        elif choice == "2":
-            new_key = input_key("KB baru")
-
-            with LOCK:
-                KEYS["Bob"] = new_key
-
-            print(
-                "KB di KDC berubah. "
-                "Bob juga harus memakai KB yang sama."
-            )
-
-        elif choice == "3":
-            continue
-
-        else:
-            print("Pilihan tidak valid.")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, default=5000)
+
     args = parser.parse_args()
 
-    KEYS["Alice"] = input_key("KA")
-    KEYS["Bob"] = input_key("KB")
-
-    threading.Thread(
-        target=console_menu,
-        daemon=True
-    ).start()
+    KEYS["Alice"] = input_key("KA untuk Alice")
+    KEYS["Bob"] = input_key("KB untuk Bob")
 
     with socket.socket(
-        socket.AF_INET, socket.SOCK_STREAM
+        socket.AF_INET,
+        socket.SOCK_STREAM
     ) as server:
 
         server.setsockopt(
@@ -211,9 +184,7 @@ def main():
         server.bind((args.host, args.port))
         server.listen()
 
-        print(
-            f"KDC berjalan pada {args.host}:{args.port}"
-        )
+        print(f"KDC berjalan pada {args.host}:{args.port}")
 
         while True:
             conn, address = server.accept()
